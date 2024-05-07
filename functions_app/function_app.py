@@ -1,25 +1,59 @@
-import azure.functions as func
+import functools
+import inspect
+import json
 import logging
+import os
+
+import azure.functions as func
+from azure.cosmos import PartitionKey
+from azure.cosmos.aio import CosmosClient
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
+
+COSMOS_ENDPOINT = os.environ['CosmosDBEndpoint']
+COSMOS_KEY = os.environ['CosmosDBKey']
+COSMOS_DATABASE = os.environ['CosmosDBDatabase']
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-@app.route('http_trigger')
-def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function processed a request.')
+cosmos = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
+database = cosmos.get_database_client(COSMOS_DATABASE)
 
-    name = req.params.get('name')
-    if not name:
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            pass
-        else:
-            name = req_body.get('name')
 
-    if name:
-        return func.HttpResponse(f'Hello, {name}. This HTTP triggered function executed successfully.')
-    else:
-        return func.HttpResponse(
-             'This HTTP triggered function executed successfully. Pass a name in the query string or in the request body for a personalized response.',
-             status_code=200
-        )
+def _json(fun):
+    @functools.wraps(fun)
+    async def inner(*args, **kwargs):
+        resp = fun(*args, **kwargs)
+        if inspect.iscoroutinefunction(fun):
+            resp = await resp
+        if isinstance(resp, tuple) and len(resp) == 2:
+            data, code = resp
+        elif resp is None or isinstance(resp, (dict, list)):
+            data = resp
+            code = 200
+        return func.HttpResponse(json.dumps(data), status_code=code, mimetype='application/json')
+
+    return inner
+
+
+async def get_container(id: str):
+    return await database.create_container_if_not_exists(id, PartitionKey('/id'))
+
+
+async def get_item(container_id: str, id: str):
+    container = await get_container(container_id)
+    try:
+        return await container.read_item(id, id)
+    except CosmosResourceNotFoundError:
+        return None
+
+
+@app.route('items/{id}', methods=['GET'])
+@_json
+async def route_get_item(req: func.HttpRequest):
+    id = req.route_params['id']
+    logging.info(f'GET /items/{id}')
+    container = await get_container('TestContainer')
+    document = await container.read_item(id, id)
+    if document is not None:
+        return document
+    return None, 500
